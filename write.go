@@ -4,7 +4,6 @@ package websocket
 
 import (
 	"bufio"
-	"compress/flate"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -12,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/flate"
 	"golang.org/x/xerrors"
 
 	"nhooyr.io/websocket/internal/errd"
@@ -59,8 +59,8 @@ type msgWriter struct {
 	closed bool
 	flate  bool
 
-	trimWriter  *trimLastFourBytesWriter
-	flateWriter *flate.Writer
+	trimWriter *trimLastFourBytesWriter
+	dict       slidingWindow
 }
 
 func newMsgWriter(c *Conn) *msgWriter {
@@ -78,10 +78,7 @@ func (mw *msgWriter) ensureFlate() {
 		}
 	}
 
-	if mw.flateWriter == nil {
-		mw.flateWriter = getFlateWriter(mw.trimWriter)
-	}
-
+	mw.dict.init(8192)
 	mw.flate = true
 }
 
@@ -138,13 +135,6 @@ func (mw *msgWriter) reset(ctx context.Context, typ MessageType) error {
 	return nil
 }
 
-func (mw *msgWriter) returnFlateWriter() {
-	if mw.flateWriter != nil {
-		putFlateWriter(mw.flateWriter)
-		mw.flateWriter = nil
-	}
-}
-
 // Write writes the given bytes to the WebSocket connection.
 func (mw *msgWriter) Write(p []byte) (_ int, err error) {
 	defer errd.Wrap(&err, "failed to write")
@@ -165,7 +155,9 @@ func (mw *msgWriter) Write(p []byte) (_ int, err error) {
 	}
 
 	if mw.flate {
-		return mw.flateWriter.Write(p)
+		err = flate.StatelessDeflate(mw.trimWriter, p, false, mw.dict.buf)
+		mw.dict.write(p)
+		return len(p), err
 	}
 
 	return mw.write(p)
@@ -192,9 +184,9 @@ func (mw *msgWriter) Close() (err error) {
 	}
 
 	if mw.flate {
-		err = mw.flateWriter.Flush()
+		err = flate.StatelessDeflate(mw.trimWriter, nil, true, nil)
 		if err != nil {
-			return xerrors.Errorf("failed to flush flate writer: %w", err)
+			return xerrors.Errorf("failed to flush flate: %w", err)
 		}
 	}
 
@@ -208,15 +200,16 @@ func (mw *msgWriter) Close() (err error) {
 	}
 
 	if mw.flate && !mw.flateContextTakeover() {
-		mw.returnFlateWriter()
+		mw.dict.close()
 	}
+
 	mw.mu.Unlock()
 	return nil
 }
 
 func (mw *msgWriter) close() {
 	mw.writeMu.Lock()
-	mw.returnFlateWriter()
+	mw.dict.close()
 }
 
 func (c *Conn) writeControl(ctx context.Context, opcode opcode, p []byte) error {
